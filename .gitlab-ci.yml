@@ -7,6 +7,9 @@
 #
 # What runs here: the shared/ C core, which is intentionally free of Apple frameworks.
 # Also the ci_scripts/ contract tests (ci-scripts: shellcheck + ci_scripts/tests/run.sh).
+# Also the web/ contract tests (web-seo: node --test, no dependencies): JSON-LD graph,
+# language pair, sitemap, IndexNow script with mocked fetch. web/tests/seo-live.test.mjs
+# fetches production and stays outside CI.
 # If shared-ctest goes red, the portability promise in shared/CMakeLists.txt is broken.
 #
 # What runs on GitHub (.github/workflows/):
@@ -38,6 +41,17 @@ ci-scripts:
   script:
     - shellcheck -S warning ci_scripts/*.sh ci_scripts/tests/*.sh scripts/asc-api.sh
     - bash ci_scripts/tests/run.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+web-seo:
+  stage: test
+  image: node:24-alpine
+  script:
+    - node --version
+    - node --test web/tests/seo.test.mjs web/tests/indexnow.test.mjs
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

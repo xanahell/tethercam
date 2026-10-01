@@ -11,6 +11,7 @@ the product. Markup and llms.txt are supporting files; their presence does not p
 indexing, rankings, AI citations or conversion.
 
 Last full pass: 2026-09-10.
+Technical contract (JSON-LD graph, language pair, sitemap, tests) updated 2026-10-01 after SEO wave 1 (MR !4).
 
 ---
 
@@ -26,10 +27,12 @@ Last full pass: 2026-09-10.
 | `#compare` section: video-call instructions plus a neutral comparison table against Continuity Camera, Camo, EpocCam, Iriun | same |
 | FAQ with matching `FAQPage` JSON-LD in each language (USB vs Wi-Fi, Continuity Camera, Zoom/Meet/Teams/FaceTime, without OBS, latency, audio, price, requirements, Windows/Linux, competitors) | same |
 | `SoftwareApplication` JSON-LD with `featureList`, `offers` price 0, licences, requirements | same |
-| `Organization`, `WebSite`, `VideoObject` graph; `BreadcrumbList`, `WebPage` and a troubleshooting `FAQPage` on `/install` | same |
-| Canonical URL and `hreflang` en / de / x-default on every page | all pages |
-| `sitemap.xml` (5 URLs, homepage and guides updated 2026-09-10), `robots.txt` allowing GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, PerplexityBot, Google-Extended, Applebot-Extended | `web/sitemap.xml`, `web/robots.txt` |
+| Exactly one JSON-LD block with one `@graph` per page; fixed `@id`s and all pure `@id` references resolved within that page. Identical shared `Organization`, `Person`, `WebSite` nodes at `https://tethercam.app/#organization`, `#person`, `#website`; page URL + `#webpage` on each page, + `#software`, `#faq`, `#demo-video` on both homepages, + `#breadcrumb`, `#faq` on `/install`, + `#breadcrumb` on `/changelog` | `index.html`, `de/index.html`, `install.html`, `changelog.html`; `/privacy` still has a block without `@graph` and is excluded from this contract (#40) |
+| Exactly one canonical per page. Reciprocal `hreflang` en / de / x-default only on `/` and `/de` (en and x-default point to `/`, de to `/de`); `/install`, `/changelog`, `/privacy` have only an en self-reference. No German subpages or references to `/de/` | all five pages |
+| `sitemap.xml`: XHTML namespace, exactly 5 canonical URLs (`/`, `/privacy`, `/install`, `/changelog`, `/de`), no trailing slash except `/`; en / de / x-default alternatives only on the homepage pair. Subpage `lastmod` equals the visible page date; homepage dates are valid and no later than today UTC. `robots.txt` allows GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, PerplexityBot, Google-Extended, Applebot-Extended | `web/sitemap.xml`, `web/robots.txt` |
 | `llms.txt`: concise answers covering downloads, setup, audio, requirements and verified compatibility | `web/llms.txt`, linked from every page via `<link rel="alternate" type="text/plain">` |
+| Public IndexNow key (by design; content equals filename without `.txt`) and operator script with a network-free dry run by default | `web/610d0bee4021d7f563d233493b8010b9.txt`, `web/scripts/indexnow.mjs` |
+| Local SEO and mocked IndexNow suites, shared SEO helpers and a separate operator-only live suite; `/tests` and `/scripts` excluded from deployment | `web/tests/seo.test.mjs`, `web/tests/indexnow.test.mjs`, `web/tests/seo-lib.mjs`, `web/tests/seo-live.test.mjs`, `web/.vercelignore` |
 
 ### GitHub (`README.md`)
 
@@ -136,20 +139,80 @@ above; it does not replace it.
 ### After every change to `web/`
 
 ```bash
-# Parse JSON-LD and sitemap, then check markup
-python3 - <<'PY'
-import re, json
-for f in ["web/index.html","web/de/index.html","web/install.html","web/changelog.html","web/privacy.html"]:
-    s = open(f, encoding="utf-8").read()
-    for block in re.findall(r'<script type="application/ld\+json">(.*?)</script>', s, re.S):
-        json.loads(block)
-    print(f, "ok")
-PY
-python3 -c "import xml.dom.minidom; xml.dom.minidom.parse('web/sitemap.xml'); print('sitemap ok')"
-tidy -q -e web/index.html            # markup errors, warnings are noisy and mostly fine
+# Node >= 20; no dependencies
+node --test web/tests/seo.test.mjs web/tests/indexnow.test.mjs
+tidy -q -e web/index.html            # optional markup check; warnings are noisy and mostly fine
 ```
 
+GitLab job `web-seo` in `.gitlab-ci.yml` runs the same command on `node:24-alpine`
+in merge request pipelines, on the default branch and on tags.
+Set `SEO_WEB_ROOT` to the path of a copy of `web/` to run the SEO suite against it.
+The suites enforce:
+
+- One JSON-LD block with an `@graph` array, resolved pure `@id` references and
+  identical shared Organization, Person and WebSite nodes. Exactly one WebSite node,
+  whose `alternateName` is nonempty and differs from the SoftwareApplication's. Forbidden
+  types: SearchAction, Speakable, MedicalWebPage, AggregateRating, Review, HowTo;
+  forbidden properties: speakable, aggregateRating, review, potentialAction.
+- WebPage `@id`, URL and language match the page; exactly one canonical;
+  reciprocal homepage hreflang; no `tethercam.app/de/` URLs or `href="/de/…"` links.
+  `dateModified` is absent
+  on homepages and matches the visible date on `/install` ("Last updated:") and
+  `/changelog` (top release heading). FAQ questions occur verbatim in visible text.
+- Decoded titles of 1–60 characters, descriptions of 110–160 characters,
+  OG/Twitter image values starting with `https://` (validity and availability are not
+  checked) and exactly one `<h1>`.
+- Sitemap XHTML namespace, exact five canonical URLs without trailing slashes
+  except `/`, reciprocal homepage alternatives, subpage dates matching visible
+  dates and valid homepage dates no later than today UTC; no `tethercam.app/de/` in
+  `llms.txt`.
+- IndexNow payload, network-free dry run, key preflight, environment and host
+  guards, explicit URL overrides and exit codes, using mocked network calls. Both
+  modes need exactly one local key file `<32 lowercase hex>.txt` whose trimmed
+  content equals its name; otherwise exit 2 before any network call.
+
+`/privacy` page checks are skipped (#40, legal text); its sitemap `lastmod` is
+still checked against its visible date. Its JSON-LD is not graph-conformant.
+
 Then, once deployed:
+
+Production comes from pushes to `main` of the GitHub mirror `Kanevry/tethercam`
+through Vercel's Git integration (`vercel[bot]` deployments on GitHub commits;
+measured 2026-10-01). A GitLab merge alone does not update the live site.
+Only after an authorized production deploy, run the live suite; it never runs in CI:
+
+```bash
+SEO_BASE_URL=https://tethercam.app node --test web/tests/seo-live.test.mjs
+```
+
+It fetches the sitemap and its pages sequentially at least 7.5 seconds apart,
+checks 200 responses without redirects, graphs, canonicals, `https://` image values and
+snippet lengths (skipping `/privacy`, #40), verifies 404s for a missing route and
+the test/script paths, and checks that `/de/` redirects to `/de`.
+
+IndexNow is a separate operator step. First review the payload with a network-free dry run:
+
+```bash
+node web/scripts/indexnow.mjs --site https://tethercam.app
+```
+
+JSON goes to stdout, "Trockenlauf, nichts gesendet" to stderr; exit 0.
+Only the operator sends after the production deploy:
+
+```bash
+node web/scripts/indexnow.mjs --site https://tethercam.app --send
+```
+
+`--send` first GETs `keyLocation` without following redirects; only status 200
+and a body matching the key (after trimming whitespace) permit the POST to
+`https://api.indexnow.org/indexnow`. Exit 0 means dry run or POST 200/202;
+exit 1 means another POST status or POST network error; exit 2 means invalid
+input, a failed key preflight (including network error), or the environment guard,
+with no POST. When `VERCEL_ENV` is set to anything except `production`, sending
+is blocked with exit 2 before any network call. Repeated `--url` options replace
+the sitemap URL list; every URL must share the host (including port) of `--site`.
+
+Further manual checks once deployed:
 
 - **Rich Results Test** ; https://search.google.com/test/rich-results, run against
   `https://tethercam.app/` and `https://tethercam.app/install`. Check the detected Software App, Video and
@@ -176,7 +239,7 @@ Then, once deployed:
    tails, not "webcam": `iphone webcam usb mac`, `obs iphone camera`, `continuity camera
    alternative`, `iphone webcam ohne wlan`. Rising impressions with a low CTR means the
    title and description do not match the query ; fix the description first, it is free.
-5. *Pages* → excluded reasons. "Duplicate without user-selected canonical" on `/de/` would
+5. *Pages* → excluded reasons. "Duplicate without user-selected canonical" on `/de` would
    mean the hreflang pair broke.
 
 ### Are AI answers citing tethercam.app?
