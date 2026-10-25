@@ -99,14 +99,37 @@ for (const page of pages) {
 
 test.skip('privacy.html: geparkt: Rechtstext-Sperrzone, Refs #40');
 
-test('shared Organization, Person and WebSite nodes are identical on every page', () => {
+test('shared Organization and WebSite nodes are identical on every page', () => {
   // Same @id with different content on two pages gives search engines conflicting facts.
-  const shared = ['Organization', 'Person', 'WebSite'];
+  const shared = ['Organization', 'WebSite'];
   const pick = file => JSON.stringify(shared.map(type => graphOf(analyseHtml(read(file))).filter(n => typed(n, type))));
   const first = pick(pages[0].file);
-  assert.notEqual(first, JSON.stringify([[], [], []]), `${pages[0].file}: shared nodes missing`);
+  assert.notEqual(first, JSON.stringify([[], []]), `${pages[0].file}: shared nodes missing`);
   for (const { file } of pages.slice(1)) assert.equal(pick(file), first, `${file}: shared nodes differ from ${pages[0].file}`);
 });
+
+// One Person on every product domain (gotzendorfer-v2#495, docs/seo/entitaetsvertrag.md there),
+// described in full wherever it is referenced because its node lives on the hub.
+const hubPerson = { '@type': 'Person', '@id': 'https://www.gotzendorfer.at/#person', name: 'Bernhard Götzendorfer', url: 'https://www.gotzendorfer.at' };
+function personsIn(value, found = []) {
+  if (Array.isArray(value)) value.forEach(item => personsIn(item, found));
+  else if (value && typeof value === 'object') {
+    if (typed(value, 'Person')) found.push(value);
+    Object.values(value).forEach(item => personsIn(item, found));
+  }
+  return found;
+}
+for (const { file } of pages) {
+  test(`${file}: every Person is the hub identity and Organization sameAs has no hub URL`, () => {
+    const graph = graphOf(analyseHtml(read(file)));
+    const persons = personsIn(graph);
+    assert.ok(persons.length > 0, `${file}: no Person reference`);
+    for (const person of persons) assert.deepEqual(person, hubPerson, `${file}: Person differs from the hub identity`);
+    for (const org of graph.filter(n => typed(n, 'Organization'))) {
+      for (const url of [org.sameAs ?? []].flat()) assert.doesNotMatch(url, /gotzendorfer\.at/, `${file}: hub URL in Organization sameAs`);
+    }
+  });
+}
 
 test('sitemap.xml: xhtml namespace is declared', () => {
   assert.ok(parseSitemap(read('sitemap.xml')).hasXhtmlNs, 'sitemap.xml: missing xhtml namespace');
