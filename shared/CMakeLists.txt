@@ -33,6 +33,9 @@ add_library(iucm_shared STATIC
     usbmux.c
 )
 target_include_directories(iucm_shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(WIN32)
+    target_link_libraries(iucm_shared PUBLIC ws2_32)
+endif()
 
 if(MSVC)
     target_compile_options(iucm_shared PRIVATE /W4 /WX)

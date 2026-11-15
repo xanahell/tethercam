@@ -419,6 +419,14 @@ AUDIO_CONFIG.
 Der Mac spricht zuerst mit `/var/run/usbmuxd` (Unix-Domain-Stream-Socket), um an den
 Geraeteport zu kommen. Erst danach gilt §2.
 
+**Windows (Nachtrag 2026-11-15).** Dort gibt es keinen Unix-Socket. Der Apple Mobile Device
+Service, der mit iTunes oder der App "Apple Devices" installiert wird, bedient dieselbe
+usbmuxd-Sprache als TCP-Dienst auf `127.0.0.1:27015`; Rahmung, Nachrichten und die
+PortNumber-Regel unten gelten unveraendert. `shared/usbmux.c` waehlt den Weg selbst, und
+`USBMUXD_SOCKET_ADDRESS` (`HOST:PORT`, auf POSIX auch `UNIX:/pfad`) ueberschreibt ihn. Stand:
+der TCP-Weg ist gegen einen nachgebauten usbmuxd getestet (`tools/recv-c/integration.sh`),
+noch nicht gegen den echten Windows-Dienst.
+
 ### 6.1 Rahmung
 
 16-Byte-Kopf, alles **little-endian**:

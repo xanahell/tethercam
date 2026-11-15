@@ -1,18 +1,37 @@
 /* usbmux.c — minimal usbmuxd client + hand-written XML plist codec.
  * See protocol/PROTOCOL.md section 6. MIT, (c) 2026 Bernhard Goetzendorfer. */
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
+#else
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "usbmux.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
-#include <poll.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET ux_sock;
+#define UX_BAD_SOCK INVALID_SOCKET
+#else
+#include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+typedef int ux_sock;
+#define UX_BAD_SOCK (-1)
+#endif
+
 
 #define USBMUX_DEFAULT_PROG_NAME      "obs-iphone-usb-cam"
 #define USBMUX_DEFAULT_CLIENT_VERSION "obs-iphone-usb-cam-1.0"
@@ -501,27 +520,193 @@ int usbmux_plist_decode_event(const char *xml, size_t len, struct usbmux_event *
 
 /* ------------------------------------------------------------ socket layer */
 
-static int ux_open_socket(void) {
-    struct sockaddr_un addr;
-    int                fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, USBMUX_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return -1;
-    }
-    return fd;
+/* Where usbmuxd listens:
+ *   macOS / Linux : unix socket /var/run/usbmuxd
+ *   Windows       : TCP 127.0.0.1:27015, served by Apple Mobile Device Service
+ *                   (installed with iTunes or the Apple Devices app)
+ * USBMUXD_SOCKET_ADDRESS overrides both, same convention as libimobiledevice:
+ * "HOST:PORT", or "UNIX:/path" on POSIX. It is also how the TCP path is tested
+ * on Linux against a fake usbmuxd. */
+#define USBMUX_ENV_ADDRESS "USBMUXD_SOCKET_ADDRESS"
+
+static void ux_close(ux_sock s) {
+#ifdef _WIN32
+    closesocket(s);
+#else
+    close(s);
+#endif
 }
 
-static int ux_write_all(int fd, const uint8_t *p, size_t n) {
+static int ux_interrupted(void) {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
+/* One recv/send, -1 on error. Sizes here are small; the clamp only keeps the
+ * Windows int parameter honest. */
+static ptrdiff_t ux_raw_read(ux_sock s, void *p, size_t n) {
+#ifdef _WIN32
+    int r = recv(s, (char *)p, n > (size_t)INT_MAX ? INT_MAX : (int)n, 0);
+    return r < 0 ? -1 : r;
+#else
+    return read(s, p, n);
+#endif
+}
+
+static ptrdiff_t ux_raw_write(ux_sock s, const void *p, size_t n) {
+#ifdef _WIN32
+    int w = send(s, (const char *)p, n > (size_t)INT_MAX ? INT_MAX : (int)n, 0);
+    return w < 0 ? -1 : w;
+#else
+    return write(s, p, n);
+#endif
+}
+
+/* 1 readable (or hung up: the next read reports it), 0 timeout, -1 error. */
+static int ux_wait_readable(ux_sock s, int timeout_ms) {
+    for (;;) {
+        int pr;
+#ifdef _WIN32
+        WSAPOLLFD pfd;
+        pfd.fd      = s;
+        pfd.events  = POLLIN;
+        pfd.revents = 0;
+        pr          = WSAPoll(&pfd, 1, timeout_ms);
+#else
+        struct pollfd pfd;
+        pfd.fd      = s;
+        pfd.events  = POLLIN;
+        pfd.revents = 0;
+        pr          = poll(&pfd, 1, timeout_ms);
+#endif
+        if (pr > 0) return 1;
+        if (pr == 0) return 0;
+        if (ux_interrupted()) continue;
+        return -1;
+    }
+}
+
+#ifdef _WIN32
+static INIT_ONCE g_wsa_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK ux_wsa_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    WSADATA data;
+    (void)once;
+    (void)param;
+    (void)ctx;
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+}
+#endif
+
+/* Winsock must be started once per process. Never cleaned up: the sockets
+ * live as long as the host process (OBS) does. A failed start is retried on
+ * the next call. */
+static int ux_net_init(void) {
+#ifdef _WIN32
+    return InitOnceExecuteOnce(&g_wsa_once, ux_wsa_init, NULL, NULL) ? 1 : 0;
+#else
+    return 1;
+#endif
+}
+
+/* The int in the public API holds a Winsock SOCKET. SOCKET is pointer sized on
+ * x64, but the kernel only hands out handle values that fit 32 bits, so the
+ * narrowing is lossless; the range check turns any surprise into a failure. */
+static int ux_to_fd(ux_sock s) {
+    if (s == UX_BAD_SOCK) return -1;
+#ifdef _WIN32
+    if (s > (ux_sock)INT_MAX) {
+        ux_close(s);
+        return -1;
+    }
+#endif
+    return (int)s;
+}
+
+static ux_sock ux_from_fd(int fd) {
+    return fd < 0 ? UX_BAD_SOCK : (ux_sock)fd;
+}
+
+static ux_sock ux_open_tcp(const char *host, const char *port) {
+    struct addrinfo hints, *res = NULL, *ai;
+    ux_sock         s = UX_BAD_SOCK;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0) return UX_BAD_SOCK;
+    for (ai = res; ai; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == UX_BAD_SOCK) continue;
+        if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        ux_close(s);
+        s = UX_BAD_SOCK;
+    }
+    freeaddrinfo(res);
+    return s;
+}
+
+/* "HOST:PORT", HOST may be a bracketed IPv6 literal. */
+static ux_sock ux_open_tcp_spec(const char *spec) {
+    char        host[256];
+    const char *colon = strrchr(spec, ':');
+    size_t      hlen;
+    if (!colon || colon == spec || colon[1] == '\0') return UX_BAD_SOCK;
+    hlen = (size_t)(colon - spec);
+    if (spec[0] == '[' && colon[-1] == ']') {
+        spec++;
+        hlen -= 2;
+    }
+    if (hlen == 0 || hlen >= sizeof(host)) return UX_BAD_SOCK;
+    memcpy(host, spec, hlen);
+    host[hlen] = '\0';
+    return ux_open_tcp(host, colon + 1);
+}
+
+#ifndef _WIN32
+static ux_sock ux_open_unix(const char *path) {
+    struct sockaddr_un addr;
+    ux_sock            s;
+    if (strlen(path) >= sizeof(addr.sun_path)) return UX_BAD_SOCK;
+    s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s == UX_BAD_SOCK) return UX_BAD_SOCK;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, path, strlen(path));
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        int saved = errno;
+        ux_close(s);
+        errno = saved;
+        return UX_BAD_SOCK;
+    }
+    return s;
+}
+#endif
+
+static ux_sock ux_open_socket(void) {
+    const char *env;
+    if (!ux_net_init()) return UX_BAD_SOCK;
+    env = getenv(USBMUX_ENV_ADDRESS);
+    if (env && *env) {
+#ifndef _WIN32
+        if (strncmp(env, "UNIX:", 5) == 0) return ux_open_unix(env + 5);
+#endif
+        return ux_open_tcp_spec(env);
+    }
+#ifdef _WIN32
+    return ux_open_tcp(USBMUX_TCP_HOST, USBMUX_TCP_PORT);
+#else
+    return ux_open_unix(USBMUX_SOCKET_PATH);
+#endif
+}
+
+static int ux_write_all(ux_sock s, const uint8_t *p, size_t n) {
     while (n > 0) {
-        ssize_t w = write(fd, p, n);
+        ptrdiff_t w = ux_raw_write(s, p, n);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            if (ux_interrupted()) continue;
             return USBMUX_ERR_IO;
         }
         if (w == 0) return USBMUX_ERR_IO;
@@ -531,25 +716,17 @@ static int ux_write_all(int fd, const uint8_t *p, size_t n) {
     return USBMUX_OK;
 }
 
-static int ux_read_all(int fd, uint8_t *p, size_t n, int timeout_ms) {
+static int ux_read_all(ux_sock s, uint8_t *p, size_t n, int timeout_ms) {
     while (n > 0) {
-        ssize_t r;
+        ptrdiff_t r;
         if (timeout_ms >= 0) {
-            struct pollfd pfd;
-            int           pr;
-            pfd.fd     = fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            pr         = poll(&pfd, 1, timeout_ms);
+            int pr = ux_wait_readable(s, timeout_ms);
             if (pr == 0) return USBMUX_ERR_TIMEOUT;
-            if (pr < 0) {
-                if (errno == EINTR) continue;
-                return USBMUX_ERR_IO;
-            }
+            if (pr < 0) return USBMUX_ERR_IO;
         }
-        r = read(fd, p, n);
+        r = ux_raw_read(s, p, n);
         if (r < 0) {
-            if (errno == EINTR) continue;
+            if (ux_interrupted()) continue;
             return USBMUX_ERR_IO;
         }
         if (r == 0) return USBMUX_ERR_IO; /* peer closed */
@@ -559,28 +736,28 @@ static int ux_read_all(int fd, uint8_t *p, size_t n, int timeout_ms) {
     return USBMUX_OK;
 }
 
-static int ux_send_plist(int fd, uint32_t tag, const char *xml, size_t len) {
+static int ux_send_plist(ux_sock s, uint32_t tag, const char *xml, size_t len) {
     uint8_t hdr[USBMUX_HEADER_SIZE];
     int     rc;
     usbmux_write_header(hdr, (uint32_t)len, tag);
-    rc = ux_write_all(fd, hdr, sizeof(hdr));
+    rc = ux_write_all(s, hdr, sizeof(hdr));
     if (rc) return rc;
-    return ux_write_all(fd, (const uint8_t *)xml, len);
+    return ux_write_all(s, (const uint8_t *)xml, len);
 }
 
 /* Reads one framed plist message into buf. */
-static int ux_recv_plist(int fd, char *buf, size_t cap, size_t *len, uint32_t *tag,
+static int ux_recv_plist(ux_sock s, char *buf, size_t cap, size_t *len, uint32_t *tag,
                          int timeout_ms) {
     uint8_t  hdr[USBMUX_HEADER_SIZE];
     uint32_t payload_len = 0, version = 0, message = 0;
-    int      rc = ux_read_all(fd, hdr, sizeof(hdr), timeout_ms);
+    int      rc = ux_read_all(s, hdr, sizeof(hdr), timeout_ms);
     if (rc) return rc;
     rc = usbmux_parse_header(hdr, &payload_len, &version, &message, tag);
     if (rc) return rc;
     if (version != USBMUX_VERSION || message != USBMUX_MESSAGE_PLIST)
         return USBMUX_ERR_PROTOCOL;
     if (payload_len >= cap) return USBMUX_ERR_CAPACITY;
-    rc = ux_read_all(fd, (uint8_t *)buf, payload_len, timeout_ms);
+    rc = ux_read_all(s, (uint8_t *)buf, payload_len, timeout_ms);
     if (rc) return rc;
     buf[payload_len] = '\0';
     *len             = payload_len;
@@ -592,27 +769,28 @@ int usbmux_list_devices(struct usbmux_device *out, size_t max, size_t *count) {
     char    *resp;
     size_t   req_len = 0, resp_len = 0;
     uint32_t tag     = 0;
-    int      fd, rc;
+    ux_sock  s;
+    int      rc;
 
     if (!out || !count || max == 0) return USBMUX_ERR_BADARG;
     *count = 0;
     rc     = usbmux_plist_encode_listdevices(req, sizeof(req), NULL, NULL, &req_len);
     if (rc) return rc;
 
-    fd = ux_open_socket();
-    if (fd < 0) return USBMUX_ERR_IO;
+    s = ux_open_socket();
+    if (s == UX_BAD_SOCK) return USBMUX_ERR_IO;
 
     resp = (char *)malloc(USBMUX_MAX_PAYLOAD + 1);
     if (!resp) {
-        close(fd);
+        ux_close(s);
         return USBMUX_ERR_IO;
     }
-    rc = ux_send_plist(fd, 1, req, req_len);
+    rc = ux_send_plist(s, 1, req, req_len);
     if (rc == USBMUX_OK)
-        rc = ux_recv_plist(fd, resp, USBMUX_MAX_PAYLOAD + 1, &resp_len, &tag, 5000);
+        rc = ux_recv_plist(s, resp, USBMUX_MAX_PAYLOAD + 1, &resp_len, &tag, 5000);
     if (rc == USBMUX_OK) rc = usbmux_plist_decode_devicelist(resp, resp_len, out, max, count);
     free(resp);
-    close(fd);
+    ux_close(s);
     return rc;
 }
 
@@ -620,7 +798,8 @@ int usbmux_connect(uint32_t device_id, uint16_t port, int *result) {
     char     req[1024], resp[4096];
     size_t   req_len = 0, resp_len = 0;
     uint32_t tag = 0, number = 0;
-    int      fd, rc;
+    ux_sock  s;
+    int      rc;
 
     if (result) *result = -1;
     /* port stays in host order all the way down: the swap happens in the encoder. */
@@ -628,52 +807,53 @@ int usbmux_connect(uint32_t device_id, uint16_t port, int *result) {
                                      &req_len);
     if (rc) return -1;
 
-    fd = ux_open_socket();
-    if (fd < 0) return -1;
+    s = ux_open_socket();
+    if (s == UX_BAD_SOCK) return -1;
 
-    rc = ux_send_plist(fd, 3, req, req_len);
-    if (rc == USBMUX_OK) rc = ux_recv_plist(fd, resp, sizeof(resp), &resp_len, &tag, 5000);
+    rc = ux_send_plist(s, 3, req, req_len);
+    if (rc == USBMUX_OK) rc = ux_recv_plist(s, resp, sizeof(resp), &resp_len, &tag, 5000);
     if (rc == USBMUX_OK) rc = usbmux_plist_decode_result(resp, resp_len, &number);
     if (rc != USBMUX_OK) {
-        close(fd);
+        ux_close(s);
         return -1;
     }
     if (result) *result = (int)number;
     if (number != USBMUX_RESULT_OK) {
-        close(fd);
+        ux_close(s);
         return -1;
     }
     /* From here the socket is a raw byte tunnel to the device port. */
-    return fd;
+    return ux_to_fd(s);
 }
 
 int usbmux_listen(int *fd_out) {
     char     req[1024], resp[4096];
     size_t   req_len = 0, resp_len = 0;
     uint32_t tag = 0, number = 0;
-    int      fd, rc;
+    ux_sock  s;
+    int      rc;
 
     if (!fd_out) return USBMUX_ERR_BADARG;
     *fd_out = -1;
     rc      = usbmux_plist_encode_listen(req, sizeof(req), NULL, NULL, &req_len);
     if (rc) return rc;
 
-    fd = ux_open_socket();
-    if (fd < 0) return USBMUX_ERR_IO;
+    s = ux_open_socket();
+    if (s == UX_BAD_SOCK) return USBMUX_ERR_IO;
 
-    rc = ux_send_plist(fd, 2, req, req_len);
-    if (rc == USBMUX_OK) rc = ux_recv_plist(fd, resp, sizeof(resp), &resp_len, &tag, 5000);
+    rc = ux_send_plist(s, 2, req, req_len);
+    if (rc == USBMUX_OK) rc = ux_recv_plist(s, resp, sizeof(resp), &resp_len, &tag, 5000);
     if (rc == USBMUX_OK) rc = usbmux_plist_decode_result(resp, resp_len, &number);
     if (rc != USBMUX_OK) {
-        close(fd);
+        ux_close(s);
         return rc;
     }
     if (number != USBMUX_RESULT_OK) {
-        close(fd);
+        ux_close(s);
         return USBMUX_ERR_RESULT;
     }
-    *fd_out = fd;
-    return USBMUX_OK;
+    *fd_out = ux_to_fd(s);
+    return *fd_out < 0 ? USBMUX_ERR_IO : USBMUX_OK;
 }
 
 #define USBMUX_EVENT_BUF 65536
@@ -685,11 +865,47 @@ int usbmux_listen_next(int fd, struct usbmux_event *out, int timeout_ms) {
     int      rc;
     if (!out || fd < 0) return USBMUX_ERR_BADARG;
     memset(out, 0, sizeof(*out));
-    rc = ux_recv_plist(fd, resp, sizeof(resp), &resp_len, &tag, timeout_ms);
+    rc = ux_recv_plist(ux_from_fd(fd), resp, sizeof(resp), &resp_len, &tag, timeout_ms);
     if (rc) return rc;
     /* Events carry tag 0, not the tag of the Listen request. Filtering by the
      * request tag here would silently drop every event. */
     return usbmux_plist_decode_event(resp, resp_len, out);
+}
+
+int usbmux_connect_tcp(const char *host_port) {
+    if (!host_port || !ux_net_init()) return -1;
+    return ux_to_fd(ux_open_tcp_spec(host_port));
+}
+
+/* ---- I/O on the descriptors above ----
+ * On Windows read()/poll()/close() do not work on a SOCKET, so callers go
+ * through these instead of the C library. */
+
+int usbmux_io_read(int fd, void *buf, size_t n) {
+    for (;;) {
+        ptrdiff_t r;
+        if (fd < 0 || !buf || n == 0) return -1;
+        r = ux_raw_read(ux_from_fd(fd), buf, n);
+        if (r < 0) {
+            if (ux_interrupted()) continue;
+            return -1;
+        }
+        return (int)(r > INT_MAX ? INT_MAX : r);
+    }
+}
+
+int usbmux_io_write_all(int fd, const void *buf, size_t n) {
+    if (fd < 0 || (!buf && n > 0)) return USBMUX_ERR_BADARG;
+    return ux_write_all(ux_from_fd(fd), (const uint8_t *)buf, n);
+}
+
+int usbmux_io_wait_readable(int fd, int timeout_ms) {
+    if (fd < 0) return -1;
+    return ux_wait_readable(ux_from_fd(fd), timeout_ms);
+}
+
+void usbmux_io_close(int fd) {
+    if (fd >= 0) ux_close(ux_from_fd(fd));
 }
 
 const char *usbmux_strerror(int code) {

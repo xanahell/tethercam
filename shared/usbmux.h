@@ -1,6 +1,7 @@
 /* usbmux.h — minimal usbmuxd client, see protocol/PROTOCOL.md section 6.
- * C11 + POSIX sockets. Hand-written XML plist codec, no CoreFoundation, so this
- * builds and tests on Linux. MIT, (c) 2026 Bernhard Goetzendorfer. */
+ * C11 + POSIX sockets, or Winsock on Windows (link ws2_32). Hand-written XML
+ * plist codec, no CoreFoundation, so this builds and tests on Linux.
+ * MIT, (c) 2026 Bernhard Goetzendorfer. */
 #ifndef IUCM_USBMUX_H
 #define IUCM_USBMUX_H
 
@@ -12,6 +13,11 @@ extern "C" {
 #endif
 
 #define USBMUX_SOCKET_PATH   "/var/run/usbmuxd"
+/* Windows: Apple Mobile Device Service (iTunes or the Apple Devices app) serves
+ * the same protocol on loopback TCP. USBMUXD_SOCKET_ADDRESS overrides the
+ * default on every platform: "HOST:PORT", or "UNIX:/path" on POSIX. */
+#define USBMUX_TCP_HOST      "127.0.0.1"
+#define USBMUX_TCP_PORT      "27015"
 #define USBMUX_HEADER_SIZE   16u
 #define USBMUX_VERSION       1u
 #define USBMUX_MESSAGE_PLIST 8u
@@ -87,13 +93,32 @@ int usbmux_plist_decode_event(const char *xml, size_t len, struct usbmux_event *
 int usbmux_list_devices(struct usbmux_device *out, size_t max, size_t *count);
 /* Opens a tunnel to device_id:port (port in HOST order). Returns the fd, or -1.
  * On -1, *result (may be NULL) carries the usbmuxd Number when one was received,
- * otherwise -1; errno is set for syscall failures. */
+ * otherwise -1; errno is set for syscall failures (not on Windows, where the
+ * reason is in WSAGetLastError()).
+ * The returned value is a socket. On macOS and Linux it is an ordinary file
+ * descriptor; on Windows it is not, so portable code reads, writes, polls and
+ * closes it through usbmux_io_* below. */
 int usbmux_connect(uint32_t device_id, uint16_t port, int *result);
 /* Opens the event connection and sends Listen. Returns USBMUX_OK and sets *fd_out. */
 int usbmux_listen(int *fd_out);
 /* Waits up to timeout_ms for the next Attached/Detached. USBMUX_ERR_TIMEOUT when
  * none arrived. Filtered (non-USB) events are returned as USBMUX_EVENT_NONE. */
 int usbmux_listen_next(int fd, struct usbmux_event *out, int timeout_ms);
+
+/* Plain TCP to "HOST:PORT", bypassing usbmuxd: for the simulator and the
+ * plugin's "Debug TCP address". Returns the descriptor, or -1. */
+int usbmux_connect_tcp(const char *host_port);
+
+/* ---- I/O on the descriptors returned above ----
+ * Portable stand-ins for read / write / poll / close. */
+/* One read: bytes read (> 0), 0 when the peer closed, -1 on error. */
+int  usbmux_io_read(int fd, void *buf, size_t n);
+/* Writes all n bytes. USBMUX_OK, or USBMUX_ERR_IO / USBMUX_ERR_BADARG. */
+int  usbmux_io_write_all(int fd, const void *buf, size_t n);
+/* 1 when a read will not block (data or hang-up), 0 on timeout, -1 on error.
+ * timeout_ms < 0 waits forever. */
+int  usbmux_io_wait_readable(int fd, int timeout_ms);
+void usbmux_io_close(int fd);
 
 const char *usbmux_strerror(int code);
 
