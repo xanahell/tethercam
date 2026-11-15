@@ -313,6 +313,7 @@ Development happens on GitHub (`Kanevry/tethercam`): issues, pull requests and r
 | `mac-app/` | macOS menu bar app plus CoreMediaIO Camera Extension, the virtual camera (MIT, released since 0.2.1) |
 | `shared/` | Pure C11 core: IUCM frame parser and usbmuxd client, no Apple frameworks (MIT) |
 | `tools/` | Swift package: protocol codec, sender simulator, CLI receiver (MIT) |
+| `tools/recv-c/` | Portable C receiver for Windows, macOS and Linux, first step of a Windows port (MIT) |
 | `protocol/` | The normative wire protocol spec |
 | `docs/` | Architecture notes, design spec, images |
 
@@ -328,6 +329,9 @@ swift test --package-path tools
 
 # End to end without a phone: simulator plus CLI receiver plus ffmpeg check
 bash tools/integration.sh
+
+# Same without Swift: fake usbmuxd over loopback TCP plus the portable C receiver
+bash tools/recv-c/integration.sh
 
 # iOS unit tests, no device and no camera needed (or any available simulator,
 # e.g. UsbCam-Test-iPhone17 on the maintainer machine)
@@ -352,7 +356,7 @@ swift build -c release --package-path tools
 - Signed and notarized plugin releases: done since 0.1.0.
 - Audio from the phone: shipped in 0.2.0 (AAC-LC over the same cable, mute switch in the app).
 - Virtual camera as a macOS Camera Extension (CMIO), so the picture also shows up in Zoom, FaceTime and Safari: released in 0.2.1 as the signed and notarized `TetherCam-mac.dmg`. See [the virtual camera section](#zoom-meet-facetime-and-every-other-mac-app-the-tethercam-virtual-camera). A Mac App Store listing is a separate, open idea ([#15](https://github.com/Kanevry/tethercam/issues/15)).
-- Receivers for Windows and Linux. The C core already builds there.
+- Receivers for Windows and Linux. The C core builds there, and [`tools/recv-c`](tools/recv-c/README.md) is a portable receiver on top of it with a Winsock path to usbmuxd (Windows needs iTunes or the Apple Devices app). Still open: trying it on a real Windows machine, an OBS plugin with a Windows HEVC decoder, and a Windows 11 virtual camera.
 - App Store listing: 0.2.0 available, verified 2026-09-10; public TestFlight beta also available.
 
 ## License
